@@ -27,7 +27,9 @@ sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0 libxcb-xkb1 libxkbcommon
 ```
 
 If not working, try:
+```bash
 pip install PyQt6 PyQt6-Qt6 PyQt6-sip --only-binary :all: -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
 
 ### 3. External Tools (Optional but Recommended)
 *   **PyMOL**: The GUI includes a "View in PyMOL" button. To use this, ensure PyMOL is installed on your system. If you use a custom PyMOL path, you may need to ensure it's accessible via your system's PATH.
