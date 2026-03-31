@@ -172,7 +172,7 @@ class ProtenixWorker(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, job_data, out_dir, script_path, cuda_home, device, model_name, use_msa, use_template, use_rna_msa, msa_dir, seeds, sample_num, recycle, diffusion_steps):
+    def __init__(self, job_data, out_dir, script_path, cuda_home, device, model_name, use_msa, use_template, use_rna_msa, seeds, sample_num, recycle, diffusion_steps):
         super().__init__()
         self.job_data = job_data
         self.out_dir = out_dir
@@ -183,7 +183,6 @@ class ProtenixWorker(QThread):
         self.use_msa = use_msa
         self.use_template = use_template
         self.use_rna_msa = use_rna_msa
-        self.msa_dir = msa_dir
         self.seeds = seeds
         self.sample_num = sample_num
         self.recycle = recycle
@@ -222,8 +221,6 @@ class ProtenixWorker(QThread):
                     cmd.extend(["--use_template", "True"])
                 if self.use_rna_msa:
                     cmd.extend(["--use_rna_msa", "True"])
-                if self.msa_dir:
-                    cmd.extend(["--msa_search_dir", self.msa_dir])
                 if self.seeds:
                     cmd.extend(["--seeds", str(self.seeds)])
                 
@@ -248,8 +245,6 @@ class ProtenixWorker(QThread):
                     cmd.extend(["--use_template", "True"])
                 if self.use_rna_msa:
                     cmd.extend(["--use_rna_msa", "True"])
-                if self.msa_dir:
-                    cmd.extend(["--msa_search_dir", self.msa_dir])
                 if self.seeds:
                     cmd.extend(["--seeds", str(self.seeds)])
                     
@@ -2844,6 +2839,59 @@ class ProtenixServerApp(QMainWindow):
             if bond_widget.is_valid():
                 bonds_data.append(bond_widget.get_data())
 
+        # Process MSA directory if provided
+        msa_dir_input = self.inp_msa_dir.text().strip()
+        if msa_dir_input and os.path.isdir(msa_dir_input):
+            protein_chain_idx = 1
+            for seq in sequences_data:
+                if "proteinChain" in seq:
+                    entity_dict = seq["proteinChain"]
+                    
+                    # Try to find MSA files for this specific chain index
+                    # Possible structures:
+                    # 1. msa_dir_input/msa/{idx}/pairing.a3m
+                    # 2. msa_dir_input/{idx}/pairing.a3m
+                    # 3. msa_dir_input/pairing.a3m (if only 1 chain)
+                    
+                    paths_to_check = [
+                        os.path.join(msa_dir_input, "msa", str(protein_chain_idx)),
+                        os.path.join(msa_dir_input, str(protein_chain_idx)),
+                        msa_dir_input
+                    ]
+                    
+                    for base_path in paths_to_check:
+                        if os.path.isdir(base_path):
+                            # Check for paired
+                            paired_path = os.path.join(base_path, "pairing.a3m")
+                            if not os.path.exists(paired_path):
+                                paired_path = os.path.join(base_path, "pairing.msa")
+                                
+                            # Check for unpaired
+                            unpaired_path = os.path.join(base_path, "non_pairing.a3m")
+                            if not os.path.exists(unpaired_path):
+                                unpaired_path = os.path.join(base_path, "non_pairing.msa")
+                                
+                            # Check for templates
+                            templates_path = os.path.join(base_path, "hmmsearch.a3m")
+                            if not os.path.exists(templates_path):
+                                templates_path = os.path.join(base_path, "hmmsearch.hhr")
+                            
+                            found_any = False
+                            if "pairedMsaPath" not in entity_dict and os.path.exists(paired_path):
+                                entity_dict["pairedMsaPath"] = os.path.abspath(paired_path)
+                                found_any = True
+                            if "unpairedMsaPath" not in entity_dict and os.path.exists(unpaired_path):
+                                entity_dict["unpairedMsaPath"] = os.path.abspath(unpaired_path)
+                                found_any = True
+                            if "templatesPath" not in entity_dict and os.path.exists(templates_path):
+                                entity_dict["templatesPath"] = os.path.abspath(templates_path)
+                                found_any = True
+                                
+                            if found_any:
+                                break # Found files for this chain, move to next chain
+                    
+                    protein_chain_idx += 1
+
         # Create job data according to Protenix JSON format
         job_data = {
             "name": name,
@@ -2955,7 +3003,6 @@ class ProtenixServerApp(QMainWindow):
             use_msa=self.toggle_msa.get_value(),
             use_template=self.toggle_template.get_value(),
             use_rna_msa=self.toggle_rna_msa.get_value(),
-            msa_dir=self.inp_msa_dir.text().strip(),
             seeds=self.inp_seeds.text().strip(),
             sample_num=self.inp_sample.currentText(),
             recycle=self.inp_recycle.text().strip(),
