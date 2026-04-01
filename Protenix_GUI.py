@@ -4,6 +4,7 @@ import json
 import subprocess
 import re
 import glob
+import platform
 from datetime import datetime
 import shlex
 
@@ -172,7 +173,7 @@ class ProtenixWorker(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, job_data, out_dir, script_path, cuda_home, device, model_name, use_msa, use_template, use_rna_msa, seeds, sample_num, recycle, diffusion_steps):
+    def __init__(self, job_data, out_dir, script_path, cuda_home, device, model_name, use_msa, use_template, use_rna_msa, seeds, sample_num, recycle, diffusion_steps, existing_json_path=None):
         super().__init__()
         self.job_data = job_data
         self.out_dir = out_dir
@@ -187,21 +188,25 @@ class ProtenixWorker(QThread):
         self.sample_num = sample_num
         self.recycle = recycle
         self.diffusion_steps = diffusion_steps
+        self.existing_json_path = existing_json_path
 
     def run(self):
         try:
             # 1. 确保输出目录存在
             os.makedirs(self.out_dir, exist_ok=True)
             
-            # 2. 生成 input.json
-            input_json_path = os.path.join(self.out_dir, "input.json")
-            with open(input_json_path, 'w', encoding='utf-8') as f:
-                if isinstance(self.job_data, list):
-                    json.dump(self.job_data, f, indent=2)
-                else:
-                    json.dump([self.job_data], f, indent=2)
-
-            self.log_signal.emit(f"[*] Input JSON saved to: {input_json_path}")
+            # 2. 生成或使用已有的 input.json
+            if self.existing_json_path and os.path.exists(self.existing_json_path):
+                input_json_path = self.existing_json_path
+                self.log_signal.emit(f"[*] Using existing JSON file: {input_json_path}")
+            else:
+                input_json_path = os.path.join(self.out_dir, "input.json")
+                with open(input_json_path, 'w', encoding='utf-8') as f:
+                    if isinstance(self.job_data, list):
+                        json.dump(self.job_data, f, indent=2)
+                    else:
+                        json.dump([self.job_data], f, indent=2)
+                self.log_signal.emit(f"[*] Generated new Input JSON at: {input_json_path}")
             
             # 3. 智能构造 Protenix 命令行指令
             script_parts = self.script_path.strip().split()
@@ -285,7 +290,7 @@ class ProtenixWorker(QThread):
             self.log_signal.emit("-" * 40)
 
             # 5. 执行命令并实时获取输出
-            process = subprocess.Popen(
+            self.process = subprocess.Popen(
                 cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
@@ -295,19 +300,142 @@ class ProtenixWorker(QThread):
                 env=run_env
             )
             
-            for line in process.stdout:
+            for line in self.process.stdout:
+                if self.isInterruptionRequested():
+                    break
                 self.log_signal.emit(line.strip())
             
-            process.wait()
+            self.process.wait()
             
             # 6. 返回执行结果
-            if process.returncode == 0:
+            if self.isInterruptionRequested() or self.process.returncode == -9 or self.process.returncode == 137: # SIGKILL
+                self.finished_signal.emit(False, f"Process aborted by user.")
+            elif self.process.returncode == 0:
                 self.finished_signal.emit(True, f"Prediction completed successfully. Results in: {self.out_dir}")
             else:
-                self.finished_signal.emit(False, f"Process exited with error code {process.returncode}")
+                self.finished_signal.emit(False, f"Process exited with error code {self.process.returncode}")
                 
         except Exception as e:
             self.finished_signal.emit(False, str(e))
+
+    def stop(self):
+        self.requestInterruption()
+        if hasattr(self, 'process') and self.process:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+
+
+class MSAMappingDialog(QDialog):
+    def __init__(self, sequences, msa_files, parent=None):
+        super().__init__(parent)
+        self.sequences = sequences  # List of dicts with info about sequences requiring MSA
+        self.msa_files = [""] + msa_files # Add empty option
+        self.mapping_result = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.setWindowTitle("Manual MSA Mapping")
+        self.resize(800, 500)
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel("Automatic MSA matching failed or was ambiguous. Please manually map the files.")
+        info_label.setStyleSheet("color: #b91c1c; font-weight: bold;")
+        layout.addWidget(info_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Sequence Type/Idx", "Paired MSA", "Unpaired MSA", "Templates"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setRowCount(len(self.sequences))
+
+        self.combos = []
+
+        for row, seq_info in enumerate(self.sequences):
+            seq_type = seq_info['type']
+            idx = seq_info['idx']
+            
+            # Display type and index
+            item = QTableWidgetItem(f"{seq_type} (Idx: {idx})")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+
+            row_combos = {}
+            
+            if seq_type == "Protein":
+                # Paired
+                cb_paired = QComboBox()
+                cb_paired.addItems(self.msa_files)
+                self.table.setCellWidget(row, 1, cb_paired)
+                row_combos['paired'] = cb_paired
+
+                # Unpaired
+                cb_unpaired = QComboBox()
+                cb_unpaired.addItems(self.msa_files)
+                self.table.setCellWidget(row, 2, cb_unpaired)
+                row_combos['unpaired'] = cb_unpaired
+
+                # Templates
+                cb_templates = QComboBox()
+                cb_templates.addItems(self.msa_files)
+                self.table.setCellWidget(row, 3, cb_templates)
+                row_combos['templates'] = cb_templates
+            else:
+                # RNA only needs unpaired usually, but we allow selection in unpaired column
+                item_na = QTableWidgetItem("N/A")
+                item_na.setFlags(item_na.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, 1, item_na)
+                
+                cb_unpaired = QComboBox()
+                cb_unpaired.addItems(self.msa_files)
+                self.table.setCellWidget(row, 2, cb_unpaired)
+                row_combos['unpaired'] = cb_unpaired
+                
+                item_na2 = QTableWidgetItem("N/A")
+                item_na2.setFlags(item_na2.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row, 3, item_na2)
+
+            self.combos.append(row_combos)
+
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        ok_btn = QPushButton("Confirm Mapping")
+        ok_btn.setObjectName("PrimaryButton")
+        ok_btn.clicked.connect(self.accept_mapping)
+        btn_layout.addWidget(ok_btn)
+
+        layout.addLayout(btn_layout)
+
+    def accept_mapping(self):
+        self.mapping_result = []
+        for i, seq_info in enumerate(self.sequences):
+            row_combos = self.combos[i]
+            mapping = {}
+            if seq_info['type'] == "Protein":
+                p = row_combos['paired'].currentText()
+                u = row_combos['unpaired'].currentText()
+                t = row_combos['templates'].currentText()
+                if p: mapping['pairedMsaPath'] = p
+                if u: mapping['unpairedMsaPath'] = u
+                if t: mapping['templatesPath'] = t
+            else:
+                u = row_combos['unpaired'].currentText()
+                if u: mapping['unpairedMsaPath'] = u
+                
+            self.mapping_result.append({
+                'seq_idx_global': seq_info['global_idx'],
+                'mapping': mapping
+            })
+            
+        self.accept()
 
 
 # --- 自定义 UI 组件 ---
@@ -574,12 +702,33 @@ class SequenceWidget(QFrame):
         layout.addLayout(meta_layout)
         
         # Sequence
-        layout.addWidget(QLabel("<span style='color:red;'>*</span> Sequence"))
+        seq_layout = QHBoxLayout()
+        self.seq_label = QLabel("<span style='color:red;'>*</span> Sequence")
+        seq_layout.addWidget(self.seq_label)
+        
+        seq_layout.addStretch()
+        
+        self.btn_browse_ligand = QPushButton("Browse File...")
+        self.btn_browse_ligand.setObjectName("OutlineButton")
+        self.btn_browse_ligand.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self.btn_browse_ligand.setVisible(False)
+        self.btn_browse_ligand.clicked.connect(self.browse_ligand_file)
+        seq_layout.addWidget(self.btn_browse_ligand)
+        
+        layout.addLayout(seq_layout)
+        
         self.seq_text = QTextEdit()
         self.seq_text.setPlaceholderText("Enter amino acid or nucleotide sequence here...")
         self.seq_text.setFixedHeight(80)
         self.seq_text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.seq_text)
+        
+        self.ligand_hint = QLabel('<i>Find SMILES at <a href="https://www.rcsb.org/search/chemical">RCSB</a>. For CCD, use prefix "CCD_" (e.g., "CCD_ATP" or "CCD_NAG_BMA_BGC" for glycans). For structure files, use prefix "FILE_" followed by path (PDB/SDF/MOL/MOL2).</i>')
+        self.ligand_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.ligand_hint.setOpenExternalLinks(True)
+        self.ligand_hint.setWordWrap(True)
+        self.ligand_hint.setVisible(False)
+        layout.addWidget(self.ligand_hint)
         
         msa_header = QHBoxLayout()
         self.msa_toggle = ArrowButton()
@@ -676,6 +825,17 @@ class SequenceWidget(QFrame):
         self.msa_toggle.set_expanded(expanded)
         self.protein_fields.setVisible(expanded)
         
+    def browse_ligand_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Ligand Structure File",
+            "",
+            "Structure Files (*.pdb *.sdf *.mol *.mol2);;All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog
+        )
+        if file_path:
+            self.seq_text.setText(f"FILE_{file_path}")
+            
     def on_delete_clicked(self):
         # 查找正确的父对象
         parent = self.parent()
@@ -704,10 +864,20 @@ class SequenceWidget(QFrame):
             mod.findChild(QLabel).setText(f"Modification {i + 1}")
             
     def on_mol_type_changed(self, mol_type):
-        # 显示/隐藏Protein特定的字段
-        is_protein = (mol_type == "Protein")
-        self.msa_toggle.setVisible(is_protein)
-        if not is_protein:
+        # 根据选择改变Sequence标签和提示
+        if mol_type == "Ligand":
+            self.seq_label.setText("<span style='color:red;'>*</span> SMILES/CCD/FILE_")
+            self.ligand_hint.setVisible(True)
+            self.btn_browse_ligand.setVisible(True)
+        else:
+            self.seq_label.setText("<span style='color:red;'>*</span> Sequence")
+            self.ligand_hint.setVisible(False)
+            self.btn_browse_ligand.setVisible(False)
+            
+        # 显示/隐藏Protein和RNA特定的字段
+        show_msa = (mol_type in ["Protein", "RNA"])
+        self.msa_toggle.setVisible(show_msa)
+        if not show_msa:
             self.protein_fields.setVisible(False)
             self.msa_toggle.set_expanded(False)
         else:
@@ -786,9 +956,27 @@ class SequenceWidget(QFrame):
         id_text = self.inp_id.text().strip()
         if id_text:
             chain_data["id"] = [x.strip() for x in id_text.split(",")]
+            
+        # For Ligand, the key is 'ligand' (can be CCD code, file path, or smiles)
+        if mol_type == "Ligand":
+            chain_data = {
+                "ligand": cleaned_sequence.strip(),
+                "count": int(self.inp_copy.text().strip())
+            }
+            if id_text:
+                chain_data["id"] = [x.strip() for x in id_text.split(",")]
         
-        # Add protein-specific fields
-        if mol_type == "Protein":
+        # For Ion, the key is name instead of sequence
+        elif mol_type == "Ion":
+            chain_data = {
+                "name": cleaned_sequence.strip(),
+                "count": int(self.inp_copy.text().strip())
+            }
+            if id_text:
+                chain_data["id"] = [x.strip() for x in id_text.split(",")]
+        
+        # Add protein/RNA-specific fields
+        if mol_type in ["Protein", "RNA"]:
             if self.paired_msa_path.text().strip():
                 chain_data["pairedMsaPath"] = self.paired_msa_path.text().strip()
             if self.unpaired_msa_path.text().strip():
@@ -1615,7 +1803,7 @@ class BatchPredictionWidget(QWidget):
             elif seq_type == "ligand":
                 sequence_data = {
                     "ligand": {
-                        "smiles": sequence,
+                        "ligand": sequence,
                         "count": count
                     }
                 }
@@ -1756,9 +1944,21 @@ class BatchPredictionWidget(QWidget):
                 file_path = os.path.join(self.auto_save_dir, default_name)
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(jobs, f, indent=2)
-            QMessageBox.information(self, "Success", f"Batch JSON saved to:\n{file_path}\n\nGenerated {len(jobs)} jobs.")
+            
+            # Open the file with the default system application
+                try:
+                    if platform.system() == 'Windows':
+                        os.startfile(file_path)
+                    elif platform.system() == 'Darwin':  # macOS
+                        subprocess.Popen(['open', file_path])
+                    else:  # Linux
+                        subprocess.Popen(['xdg-open', file_path])
+                except Exception as open_e:
+                    print(f"Failed to open file automatically: {open_e}")
+                    
+                QMessageBox.information(self, "Success", f"Batch JSON generated and opened:\n{file_path}\n\nGenerated {len(jobs)} jobs.")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to save JSON:\n{str(e)}\n\nPlease try saving to a different location like your Desktop.")
+            QMessageBox.warning(self, "Error", f"Failed to save JSON:\n{str(e)}")
         
 class ExpandableTaskWidget(QFrame):
     def __init__(self, task_data, parent=None):
@@ -2472,7 +2672,7 @@ class ProtenixServerApp(QMainWindow):
     def create_form_row(self, label_text, widget, is_required=False):
         layout = QHBoxLayout()
         lbl = QLabel(f"<span style='color:red;'>*</span> {label_text}" if is_required else label_text)
-        lbl.setFixedWidth(80)
+        lbl.setFixedWidth(130) # 增加宽度，避免被遮挡
         layout.addWidget(lbl)
         layout.addWidget(widget)
         layout.addStretch()
@@ -2523,7 +2723,27 @@ class ProtenixServerApp(QMainWindow):
         layout.setSpacing(16)
         
         # --- Global Card ---
-        card_global = Card("Global")
+        card_global = Card()
+        global_header = QHBoxLayout()
+        global_title = QLabel("Global")
+        global_title.setObjectName("CardTitle")
+        global_header.addWidget(global_title)
+        global_header.addStretch()
+        
+        load_json_btn = QPushButton("Load JSON")
+        load_json_btn.setObjectName("OutlineButton")
+        load_json_btn.setStyleSheet("font-size: 11px; padding: 4px 12px; margin-bottom: 8px; margin-right: 8px;")
+        load_json_btn.clicked.connect(self.load_json_to_ui)
+        global_header.addWidget(load_json_btn)
+        
+        new_pred_btn = QPushButton("New Prediction")
+        new_pred_btn.setObjectName("OutlineButton")
+        new_pred_btn.setStyleSheet("font-size: 11px; padding: 4px 12px; margin-bottom: 8px;")
+        new_pred_btn.clicked.connect(self.reset_all_inputs)
+        global_header.addWidget(new_pred_btn)
+        
+        card_global.add_layout(global_header)
+        
         self.inp_name = QLineEdit("protenix_prediction_job_1")
         self.inp_name.setMinimumWidth(120)
         self.inp_name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -2604,13 +2824,21 @@ class ProtenixServerApp(QMainWindow):
         msa_dir_container = QWidget()
         msa_dir_layout = QHBoxLayout(msa_dir_container)
         msa_dir_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.inp_msa_dir = QLineEdit()
-        self.inp_msa_dir.setPlaceholderText("Directory containing pre-computed MSA features")
+        self.inp_msa_dir.setPlaceholderText("Directory containing pre-computed MSA and Template features")
         msa_dir_layout.addWidget(self.inp_msa_dir)
         browse_msa_btn = QPushButton("Browse...")
         browse_msa_btn.clicked.connect(lambda: self.browse_directory(self.inp_msa_dir))
         msa_dir_layout.addWidget(browse_msa_btn)
-        card_global.add_layout(self.create_form_row("MSA search dir", msa_dir_container))
+        
+        card_global.add_layout(self.create_form_row("MSA/Template search dir", msa_dir_container))
+        
+        # 将提示说明单独放在 Global Card 的一行，使其可以延伸至边缘
+        msa_hint = QLabel("<i>For protein, 'pairing' or 'non_pairing' a3m/msa files will be used as MSA, and 'concat.hhr' or 'hmmsearch.a3m' will be used as Template. For RNA, any single a3m/msa file found will be used. Otherwise, please select manually.</i>")
+        msa_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        msa_hint.setWordWrap(True)
+        card_global.add_widget(msa_hint)
         
         card_global.layout.setContentsMargins(12, 8, 12, 8)
         card_global.layout.setSpacing(8)
@@ -2758,7 +2986,7 @@ class ProtenixServerApp(QMainWindow):
         layout.addWidget(self.log_console)
 
         submit_layout = QHBoxLayout()
-        self.generate_json_btn = QPushButton("Generate JSON")
+        self.generate_json_btn = QPushButton("Preview JSON")
         self.generate_json_btn.setObjectName("OutlineButton")
         self.generate_json_btn.setStyleSheet("font-size: 13px; padding: 8px 24px;")
         self.generate_json_btn.clicked.connect(self.generate_json)
@@ -2767,10 +2995,29 @@ class ProtenixServerApp(QMainWindow):
         self.submit_btn.setObjectName("PrimaryButton")
         self.submit_btn.clicked.connect(self.run_prediction)
         
+        self.abort_btn = QPushButton("Abort")
+        self.abort_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ef4444;
+                color: white;
+                border: none;
+                font-weight: bold;
+                padding: 8px 24px;
+                border-radius: 20px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #dc2626; }
+            QPushButton:disabled { background-color: #fca5a5; }
+        """)
+        self.abort_btn.clicked.connect(self.abort_prediction)
+        self.abort_btn.setEnabled(False)
+        
         submit_layout.addStretch()
         submit_layout.addWidget(self.generate_json_btn)
         submit_layout.addSpacing(10)
         submit_layout.addWidget(self.submit_btn)
+        submit_layout.addSpacing(10)
+        submit_layout.addWidget(self.abort_btn)
         submit_layout.addStretch()
         layout.addLayout(submit_layout)
         
@@ -2814,6 +3061,170 @@ class ProtenixServerApp(QMainWindow):
             bond.bond_number = i + 1
             bond.findChild(QLabel).setText(f"Covalent bond {i + 1}")
             
+    def reset_all_inputs(self):
+        # Reset Global
+        self.inp_name.setText("protenix_prediction_job_1")
+        self.combo_model.setCurrentIndex(0)
+        self.combo_device.setCurrentIndex(0)
+        self.inp_cuda_home.setText(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
+        self.toggle_msa.btn_true.setChecked(True)
+        self.toggle_msa.btn_false.setChecked(False)
+        self.toggle_template.btn_false.setChecked(True)
+        self.toggle_template.btn_true.setChecked(False)
+        self.toggle_rna_msa.btn_false.setChecked(True)
+        self.toggle_rna_msa.btn_true.setChecked(False)
+        self.inp_msa_dir.clear()
+        
+        # Reset Sequences
+        for seq in self.sequences[:]:
+            self.remove_sequence(seq)
+        if not self.sequences:
+            self.add_sequence()
+        
+        # Reset Bonds
+        for bond in self.covalent_bonds[:]:
+            self.remove_bond(bond)
+            
+        # Reset Settings
+        self.inp_seeds.clear()
+        self.inp_sample.setCurrentIndex(0)
+        self.inp_recycle.setText("10")
+        self.inp_diffusion.setText("200")
+        
+    def load_json_to_ui(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Input JSON File",
+            "",
+            "JSON Files (*.json)",
+            options=QFileDialog.Option.DontUseNativeDialog
+        )
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            if isinstance(data, list):
+                if len(data) == 0:
+                    raise ValueError("JSON list is empty.")
+                job_data = data[0]
+            else:
+                job_data = data
+                
+            # Clear current UI first
+            self.reset_all_inputs()
+            # Clear the default sequence added by reset_all_inputs
+            for seq in self.sequences[:]:
+                self.remove_sequence(seq)
+            
+            # Load Name
+            if "name" in job_data:
+                self.inp_name.setText(job_data["name"])
+                
+            # Load Sequences
+            if "sequences" in job_data:
+                for seq_item in job_data["sequences"]:
+                    self.add_sequence()
+                    seq_widget = self.sequences[-1]
+                    
+                    # Determine type and data
+                    if "proteinChain" in seq_item:
+                        mol_type = "Protein"
+                        entity_data = seq_item["proteinChain"]
+                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                    elif "dnaSequence" in seq_item:
+                        mol_type = "DNA"
+                        entity_data = seq_item["dnaSequence"]
+                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                    elif "rnaSequence" in seq_item:
+                        mol_type = "RNA"
+                        entity_data = seq_item["rnaSequence"]
+                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                    elif "ligand" in seq_item:
+                        mol_type = "Ligand"
+                        entity_data = seq_item["ligand"]
+                        seq_widget.inp_seq.setText(entity_data.get("ligand", entity_data.get("smiles", "")))
+                    elif "ion" in seq_item:
+                        mol_type = "Ion"
+                        entity_data = seq_item["ion"]
+                        seq_widget.inp_seq.setText(entity_data.get("name", ""))
+                    else:
+                        continue
+                        
+                    idx = seq_widget.combo_type.findText(mol_type)
+                    if idx >= 0:
+                        seq_widget.combo_type.setCurrentIndex(idx)
+                        
+                    # Load common properties
+                    if "count" in entity_data:
+                        seq_widget.inp_copy.setText(str(entity_data["count"]))
+                    if "id" in entity_data:
+                        seq_widget.inp_id.setText(", ".join(entity_data["id"]))
+                        
+                    # Load modifications
+                    if "modifications" in entity_data:
+                        mod_types = []
+                        mod_pos = []
+                        for mod in entity_data["modifications"]:
+                            if "ptmType" in mod:
+                                mod_types.append(mod["ptmType"])
+                                mod_pos.append(str(mod.get("ptmPosition", "")))
+                            elif "modificationType" in mod:
+                                mod_types.append(mod["modificationType"])
+                                mod_pos.append(str(mod.get("basePosition", "")))
+                                
+                        if mod_types:
+                            seq_widget.inp_mod_type.setText("; ".join(mod_types))
+                            seq_widget.inp_mod_pos.setText("; ".join(mod_pos))
+                            
+                    # Load MSA/Templates
+                    if "pairedMsaPath" in entity_data:
+                        seq_widget.paired_msa_path.setText(entity_data["pairedMsaPath"])
+                    if "unpairedMsaPath" in entity_data:
+                        seq_widget.unpaired_msa_path.setText(entity_data["unpairedMsaPath"])
+                    if "templatesPath" in entity_data:
+                        seq_widget.templates_path.setText(entity_data["templatesPath"])
+                        
+                    # Load Constraints
+                    if "constraint" in entity_data:
+                        seq_widget.inp_constraint.setText(json.dumps(entity_data["constraint"]))
+                    if "pocket_constraint" in entity_data:
+                        seq_widget.inp_pocket_constraint.setText(json.dumps(entity_data["pocket_constraint"]))
+                        
+            # If no sequences were added, add an empty one
+            if not self.sequences:
+                self.add_sequence()
+                
+            # Load Covalent Bonds
+            if "covalentBonds" in job_data:
+                for bond in job_data["covalentBonds"]:
+                    self.add_bond()
+                    bond_widget = self.covalent_bonds[-1]
+                    # Format: {"entities": [{"id": ["A", "1"], "atom": "C"}, ...]}
+                    entities = bond.get("entities", [])
+                    if len(entities) >= 1:
+                        e1 = entities[0]
+                        if "id" in e1 and len(e1["id"]) >= 2:
+                            bond_widget.inp_entity1.setText(e1["id"][0])
+                            bond_widget.inp_pos1.setText(str(e1["id"][1]))
+                        if "atom" in e1:
+                            bond_widget.inp_atom1.setText(e1["atom"])
+                            
+                    if len(entities) >= 2:
+                        e2 = entities[1]
+                        if "id" in e2 and len(e2["id"]) >= 2:
+                            bond_widget.inp_entity2.setText(e2["id"][0])
+                            bond_widget.inp_pos2.setText(str(e2["id"][1]))
+                        if "atom" in e2:
+                            bond_widget.inp_atom2.setText(e2["atom"])
+                            
+            QMessageBox.information(self, "Success", "JSON loaded successfully.")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load JSON:\n{str(e)}")
+
     def collect_job_data(self):
         name = self.inp_name.text().strip()
         
@@ -2843,7 +3254,20 @@ class ProtenixServerApp(QMainWindow):
         msa_dir_input = self.inp_msa_dir.text().strip()
         if msa_dir_input and os.path.isdir(msa_dir_input):
             protein_chain_idx = 1
-            for seq in sequences_data:
+            rna_chain_idx = 1
+            
+            # Find all relevant files in directory
+            all_msa_files = []
+            for root, _, files in os.walk(msa_dir_input):
+                for file in files:
+                    if file.endswith(('.a3m', '.msa', '.hhr')):
+                        all_msa_files.append(os.path.abspath(os.path.join(root, file)))
+            
+            needs_manual_mapping = False
+            sequences_to_map = []
+            
+            for seq_idx, seq in enumerate(sequences_data):
+                # Handle Protein Chain MSA
                 if "proteinChain" in seq:
                     entity_dict = seq["proteinChain"]
                     
@@ -2859,6 +3283,7 @@ class ProtenixServerApp(QMainWindow):
                         msa_dir_input
                     ]
                     
+                    found_any = False
                     for base_path in paths_to_check:
                         if os.path.isdir(base_path):
                             # Check for paired
@@ -2872,11 +3297,10 @@ class ProtenixServerApp(QMainWindow):
                                 unpaired_path = os.path.join(base_path, "non_pairing.msa")
                                 
                             # Check for templates
-                            templates_path = os.path.join(base_path, "hmmsearch.a3m")
+                            templates_path = os.path.join(base_path, "concat.hhr")
                             if not os.path.exists(templates_path):
-                                templates_path = os.path.join(base_path, "hmmsearch.hhr")
+                                templates_path = os.path.join(base_path, "hmmsearch.a3m")
                             
-                            found_any = False
                             if "pairedMsaPath" not in entity_dict and os.path.exists(paired_path):
                                 entity_dict["pairedMsaPath"] = os.path.abspath(paired_path)
                                 found_any = True
@@ -2889,8 +3313,78 @@ class ProtenixServerApp(QMainWindow):
                                 
                             if found_any:
                                 break # Found files for this chain, move to next chain
+                                
+                    # If we didn't find any files through automatic matching but files exist in the dir
+                    # AND the user hasn't already manually provided paths in the UI
+                    has_manual_paths = any(k in entity_dict for k in ["pairedMsaPath", "unpairedMsaPath", "templatesPath"])
+                    if not found_any and all_msa_files and not has_manual_paths:
+                        needs_manual_mapping = True
+                        
+                    sequences_to_map.append({
+                        'type': 'Protein',
+                        'idx': protein_chain_idx,
+                        'global_idx': seq_idx
+                    })
                     
                     protein_chain_idx += 1
+                    
+                # Handle RNA Sequence MSA
+                elif "rnaSequence" in seq:
+                    entity_dict = seq["rnaSequence"]
+                    
+                    # Similar path logic for RNA, but typically looking for non_pairing.a3m/msa
+                    paths_to_check = [
+                        os.path.join(msa_dir_input, "msa", str(rna_chain_idx)),
+                        os.path.join(msa_dir_input, str(rna_chain_idx)),
+                        msa_dir_input
+                    ]
+                    
+                    found_any = False
+                    for base_path in paths_to_check:
+                        if os.path.isdir(base_path):
+                            # For RNA, check for ANY .a3m or .msa file in the directory
+                            local_files = []
+                            try:
+                                local_files = [f for f in os.listdir(base_path) if f.endswith(('.a3m', '.msa'))]
+                            except Exception:
+                                pass
+                                
+                            # ONLY auto-match if exactly 1 file is found
+                            if len(local_files) == 1:
+                                if "unpairedMsaPath" not in entity_dict:
+                                    entity_dict["unpairedMsaPath"] = os.path.abspath(os.path.join(base_path, local_files[0]))
+                                    found_any = True
+                                break
+                                
+                    has_manual_paths = "unpairedMsaPath" in entity_dict
+                    if not found_any and all_msa_files and not has_manual_paths:
+                        needs_manual_mapping = True
+                        
+                    sequences_to_map.append({
+                        'type': 'RNA',
+                        'idx': rna_chain_idx,
+                        'global_idx': seq_idx
+                    })
+                                
+                    rna_chain_idx += 1
+            
+            # If automatic matching failed for some chains and we have files, pop up dialog
+            if needs_manual_mapping and all_msa_files:
+                dialog = MSAMappingDialog(sequences_to_map, all_msa_files, self)
+                if dialog.exec() == QDialog.DialogCode.Accepted and dialog.mapping_result:
+                    # Apply manual mappings
+                    for mapping in dialog.mapping_result:
+                        seq_idx = mapping['seq_idx_global']
+                        seq_dict = sequences_data[seq_idx]
+                        
+                        if "proteinChain" in seq_dict:
+                            seq_dict["proteinChain"].update(mapping['mapping'])
+                        elif "rnaSequence" in seq_dict:
+                            seq_dict["rnaSequence"].update(mapping['mapping'])
+                else:
+                    # User cancelled or closed, return None to abort generation
+                    QMessageBox.warning(self, "Cancelled", "MSA mapping cancelled. Job generation aborted.")
+                    return None
 
         # Create job data according to Protenix JSON format
         job_data = {
@@ -2903,19 +3397,44 @@ class ProtenixServerApp(QMainWindow):
             
         return job_data
         
+    def abort_prediction(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.log_message("[*] Aborting prediction... Please wait.")
+            self.worker.stop()
+            self.abort_btn.setEnabled(False)
+
     def generate_json_only(self):
         job_data = self.collect_job_data()
         if not job_data:
             return
             
         try:
-            default_dir = os.getcwd()
-            file_path = os.path.join(default_dir, f"{job_data['name']}.json")
+            # Save to outputs/<task_name>/input.json to match run path
+            task_name = self.inp_name.text().strip()
+            if not task_name:
+                task_name = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+            out_dir = os.path.abspath(os.path.join(os.getcwd(), "outputs", task_name))
+            os.makedirs(out_dir, exist_ok=True)
+            
+            file_path = os.path.join(out_dir, "input.json")
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump([job_data], f, indent=2)
-            QMessageBox.information(self, "Success", f"JSON file saved to:\n{file_path}")
+            
+            # Open the file with the default system application
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(file_path)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.Popen(['open', file_path])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', file_path])
+            except Exception as open_e:
+                print(f"Failed to open file automatically: {open_e}")
+                
+            QMessageBox.information(self, "Success", f"JSON file generated and opened:\n{file_path}")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to save JSON file:\n{str(e)}\n\nPlease try saving to a different location like your Desktop.")
+            QMessageBox.warning(self, "Error", f"Failed to save JSON file:\n{str(e)}")
 
     def generate_json(self):
         if hasattr(self, "prediction_tabs") and self.prediction_tabs.currentIndex() == 1:
@@ -2966,6 +3485,7 @@ class ProtenixServerApp(QMainWindow):
         
         self.submit_btn.setEnabled(False)
         self.submit_btn.setText("Running...")
+        self.abort_btn.setEnabled(True)
         self.log_console.clear()
         
         if is_batch:
@@ -3006,7 +3526,8 @@ class ProtenixServerApp(QMainWindow):
             seeds=self.inp_seeds.text().strip(),
             sample_num=self.inp_sample.currentText(),
             recycle=self.inp_recycle.text().strip(),
-            diffusion_steps=self.inp_diffusion.text().strip()
+            diffusion_steps=self.inp_diffusion.text().strip(),
+            existing_json_path=os.path.join(out_dir, "batch_inputs.json" if is_batch else "input.json")
         )
         self.worker.log_signal.connect(self.log_message)
         self.worker.finished_signal.connect(self.on_prediction_finished)
@@ -3090,6 +3611,7 @@ class ProtenixServerApp(QMainWindow):
     def on_prediction_finished(self, success, message):
         self.submit_btn.setEnabled(True)
         self.submit_btn.setText("Submit & Run Protenix")
+        self.abort_btn.setEnabled(False)
         
         if success:
             self.log_message(f"\n[SUCCESS] {message}")
