@@ -7,6 +7,10 @@ import glob
 import platform
 from datetime import datetime
 import shlex
+import csv
+import shutil
+import random
+from pathlib import Path
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QStackedWidget, 
@@ -525,7 +529,12 @@ class ModificationWidget(QFrame):
         delete_btn.clicked.connect(self.on_delete_clicked)
         layout.addWidget(delete_btn)
 
-def normalize_sequence_text(text):
+def normalize_sequence_text(text, is_ligand_or_ion=False):
+    if is_ligand_or_ion:
+        # For ligands (like SMILES or FILE_ paths) or ions, 
+        # we only strip leading/trailing whitespace and DO NOT convert to uppercase
+        return text.strip()
+        
     lines = [line for line in text.splitlines() if not line.strip().startswith(">")]
     merged = "".join(lines)
     merged = re.sub(r"\s+", "", merged)
@@ -730,6 +739,12 @@ class SequenceWidget(QFrame):
         self.ligand_hint.setVisible(False)
         layout.addWidget(self.ligand_hint)
         
+        self.ion_hint = QLabel('<i>For Ion CCD codes, DO NOT include "CCD_". For example, use "NA" for Sodium, "MG" for Magnesium.</i>')
+        self.ion_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.ion_hint.setWordWrap(True)
+        self.ion_hint.setVisible(False)
+        layout.addWidget(self.ion_hint)
+        
         msa_header = QHBoxLayout()
         self.msa_toggle = ArrowButton()
         self.msa_toggle.setStyleSheet("""
@@ -830,10 +845,31 @@ class SequenceWidget(QFrame):
             self,
             "Select Ligand Structure File",
             "",
-            "Structure Files (*.pdb *.sdf *.mol *.mol2);;All Files (*)",
+            "Structure Files (*.pdb *.sdf *.mol *.mol2 *.PDB *.SDF *.MOL *.MOL2);;All Files (*)",
             options=QFileDialog.Option.DontUseNativeDialog
         )
         if file_path:
+            # Backend json_parser.py expects strictly lower case extensions
+            path_obj = Path(file_path)
+            if path_obj.suffix and any(c.isupper() for c in path_obj.suffix):
+                # We create a local copy with a lowercase extension in the same directory
+                # so the backend can read it without throwing a ValueError
+                lower_ext = path_obj.suffix.lower()
+                new_path_str = str(path_obj.with_suffix(lower_ext))
+                
+                # Only copy if the lowercased filename doesn't already exist
+                if not os.path.exists(new_path_str) or os.path.abspath(file_path) == os.path.abspath(new_path_str):
+                    try:
+                        # Copy the file to the new lowercase extension name
+                        shutil.copy2(file_path, new_path_str)
+                        file_path = new_path_str
+                        QMessageBox.information(self, "Info", f"A copy of the ligand file with a lowercase extension was created for backend compatibility:\n{new_path_str}")
+                    except Exception as e:
+                        QMessageBox.warning(self, "Warning", f"Could not create a lowercase extension copy. You may need to rename your file manually.\nError: {e}")
+                else:
+                    # If it exists, just use it
+                    file_path = new_path_str
+
             self.seq_text.setText(f"FILE_{file_path}")
             
     def on_delete_clicked(self):
@@ -868,10 +904,17 @@ class SequenceWidget(QFrame):
         if mol_type == "Ligand":
             self.seq_label.setText("<span style='color:red;'>*</span> SMILES/CCD/FILE_")
             self.ligand_hint.setVisible(True)
+            self.ion_hint.setVisible(False)
             self.btn_browse_ligand.setVisible(True)
+        elif mol_type == "Ion":
+            self.seq_label.setText("<span style='color:red;'>*</span> Sequence")
+            self.ligand_hint.setVisible(False)
+            self.ion_hint.setVisible(True)
+            self.btn_browse_ligand.setVisible(False)
         else:
             self.seq_label.setText("<span style='color:red;'>*</span> Sequence")
             self.ligand_hint.setVisible(False)
+            self.ion_hint.setVisible(False)
             self.btn_browse_ligand.setVisible(False)
             
         # 显示/隐藏Protein和RNA特定的字段
@@ -943,8 +986,10 @@ class SequenceWidget(QFrame):
             if mod.is_valid():
                 mods_data.append(mod.get_data())
                 
-        cleaned_sequence = normalize_sequence_text(self.seq_text.toPlainText())
-        if cleaned_sequence != self.seq_text.toPlainText().strip():
+        is_ligand_or_ion = mol_type in ["Ligand", "Ion"]
+        cleaned_sequence = normalize_sequence_text(self.seq_text.toPlainText(), is_ligand_or_ion)
+        if cleaned_sequence != self.seq_text.toPlainText().strip() and not is_ligand_or_ion:
+            # We only force update the UI box if it was a protein/RNA/DNA that got uppercased/cleaned
             self.seq_text.setPlainText(cleaned_sequence)
                 
         chain_data = {
@@ -966,10 +1011,10 @@ class SequenceWidget(QFrame):
             if id_text:
                 chain_data["id"] = [x.strip() for x in id_text.split(",")]
         
-        # For Ion, the key is name instead of sequence
+        # For Ion, the key is 'ion' instead of 'name' based on backend json_parser
         elif mol_type == "Ion":
             chain_data = {
-                "name": cleaned_sequence.strip(),
+                "ion": cleaned_sequence.strip(),
                 "count": int(self.inp_copy.text().strip())
             }
             if id_text:
@@ -996,8 +1041,9 @@ class SequenceWidget(QFrame):
 
     def validate_sequence(self):
         mol_type = self.mol_combo.currentText()
-        seq = normalize_sequence_text(self.seq_text.toPlainText())
-        if seq != self.seq_text.toPlainText().strip():
+        is_ligand_or_ion = mol_type in ["Ligand", "Ion"]
+        seq = normalize_sequence_text(self.seq_text.toPlainText(), is_ligand_or_ion)
+        if seq != self.seq_text.toPlainText().strip() and not is_ligand_or_ion:
             self.seq_text.setPlainText(seq)
         if mol_type == "Protein":
             return validate_sequence_by_type(seq, "proteinChain", f"Sequence {self.seq_number}")
@@ -1763,8 +1809,10 @@ class BatchPredictionWidget(QWidget):
                 
             seq_type = type_widget.currentText()
             raw_sequence = seq_item.text() if seq_item else ""
-            cleaned_sequence = normalize_sequence_text(raw_sequence)
-            if seq_item and cleaned_sequence != raw_sequence.strip():
+            
+            is_ligand_or_ion = seq_type in ["ligand", "ion"]
+            cleaned_sequence = normalize_sequence_text(raw_sequence, is_ligand_or_ion)
+            if seq_item and cleaned_sequence != raw_sequence.strip() and not is_ligand_or_ion:
                 seq_item.setText(cleaned_sequence)
             sequence = cleaned_sequence.strip()
             if not sequence:
@@ -1810,7 +1858,7 @@ class BatchPredictionWidget(QWidget):
             elif seq_type == "ion":
                 sequence_data = {
                     "ion": {
-                        "name": sequence,
+                        "ion": sequence,
                         "count": count
                     }
                 }
@@ -3032,8 +3080,8 @@ class ProtenixServerApp(QMainWindow):
         self.seqs_layout.addWidget(seq_widget)
         self.renumber_sequences()
         
-    def remove_sequence(self, seq_widget):
-        if seq_widget in self.sequences and len(self.sequences) > 1:
+    def remove_sequence(self, seq_widget, force=False):
+        if seq_widget in self.sequences and (len(self.sequences) > 1 or force):
             self.sequences.remove(seq_widget)
             seq_widget.setParent(None)
             self.renumber_sequences()
@@ -3077,7 +3125,7 @@ class ProtenixServerApp(QMainWindow):
         
         # Reset Sequences
         for seq in self.sequences[:]:
-            self.remove_sequence(seq)
+            self.remove_sequence(seq, force=True)
         if not self.sequences:
             self.add_sequence()
         
@@ -3115,9 +3163,13 @@ class ProtenixServerApp(QMainWindow):
                 
             # Clear current UI first
             self.reset_all_inputs()
+            # **IMPORTANT**: Force application to process events so the reset is fully applied
+            QApplication.processEvents()
+            
             # Clear the default sequence added by reset_all_inputs
             for seq in self.sequences[:]:
-                self.remove_sequence(seq)
+                self.remove_sequence(seq, force=True)
+            QApplication.processEvents()
             
             # Load Name
             if "name" in job_data:
@@ -3130,32 +3182,39 @@ class ProtenixServerApp(QMainWindow):
                     seq_widget = self.sequences[-1]
                     
                     # Determine type and data
+                    mol_type = "Protein"
+                    entity_data = {}
+                    seq_text_value = ""
+                    
                     if "proteinChain" in seq_item:
                         mol_type = "Protein"
                         entity_data = seq_item["proteinChain"]
-                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                        seq_text_value = entity_data.get("sequence", "")
                     elif "dnaSequence" in seq_item:
                         mol_type = "DNA"
                         entity_data = seq_item["dnaSequence"]
-                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                        seq_text_value = entity_data.get("sequence", "")
                     elif "rnaSequence" in seq_item:
                         mol_type = "RNA"
                         entity_data = seq_item["rnaSequence"]
-                        seq_widget.inp_seq.setText(entity_data.get("sequence", ""))
+                        seq_text_value = entity_data.get("sequence", "")
                     elif "ligand" in seq_item:
                         mol_type = "Ligand"
                         entity_data = seq_item["ligand"]
-                        seq_widget.inp_seq.setText(entity_data.get("ligand", entity_data.get("smiles", "")))
+                        seq_text_value = entity_data.get("ligand", entity_data.get("smiles", ""))
                     elif "ion" in seq_item:
                         mol_type = "Ion"
                         entity_data = seq_item["ion"]
-                        seq_widget.inp_seq.setText(entity_data.get("name", ""))
+                        seq_text_value = entity_data.get("ion", entity_data.get("name", ""))
                     else:
                         continue
                         
-                    idx = seq_widget.combo_type.findText(mol_type)
+                    idx = seq_widget.mol_combo.findText(mol_type)
                     if idx >= 0:
-                        seq_widget.combo_type.setCurrentIndex(idx)
+                        seq_widget.mol_combo.setCurrentIndex(idx)
+                        
+                    # Set sequence text after changing the combo
+                    seq_widget.seq_text.setText(seq_text_value)
                         
                     # Load common properties
                     if "count" in entity_data:
@@ -3394,6 +3453,12 @@ class ProtenixServerApp(QMainWindow):
         
         if bonds_data:
             job_data["covalent_bonds"] = bonds_data
+            
+        # Add seed if empty
+        seed_val = self.inp_seeds.text().strip()
+        if not seed_val:
+            seed_val = str(random.randint(1, 999999))
+            self.inp_seeds.setText(seed_val)
             
         return job_data
         
