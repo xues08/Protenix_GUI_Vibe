@@ -2799,6 +2799,7 @@ class ProtenixServerApp(QMainWindow):
         
         self.combo_model = QComboBox()
         self.combo_model.addItems([
+            "protenix-v2",
             "protenix_base_default_v1.0.0",
             "protenix_base_20250630_v1.0.0",
             "protenix_base_default_v0.5.0",
